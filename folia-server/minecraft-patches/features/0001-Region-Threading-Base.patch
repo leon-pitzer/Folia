@@ -1053,6 +1053,18 @@ diff --git a/io/papermc/paper/redstone/RedstoneWireTurbo.java b/io/papermc/paper
 index f7820568b78f630e4d234d3dfb36c2167149777a..c567218fd667c099836a7ad8ca305ac8e9c2c96d 100644
 --- a/io/papermc/paper/redstone/RedstoneWireTurbo.java
 +++ b/io/papermc/paper/redstone/RedstoneWireTurbo.java
+@@ -622,6 +622,11 @@ public final class RedstoneWireTurbo {
+             // this is a List, preserving the insertion order of
+             // left-to-right based on direction of information flow.
+             for (UpdateNode upd : thisLayer) {
++                // Folia start - thread check redstone updates
++                if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(worldIn, upd.self, 24)) {
++                    continue;
++                }
++                // Folia end - thread check redstone updates
+                 if (upd.type == UpdateNode.Type.REDSTONE) {
+                     // If the node is is redstone wire,
+                     // schedule updates to neighbors if its value
 @@ -827,14 +827,14 @@ public final class RedstoneWireTurbo {
          j = getMaxCurrentStrength(upd, j);
          int l = 0;
@@ -2857,7 +2869,7 @@ new file mode 100644
 index 0000000000000000000000000000000000000000..5db5f9c7305dcab20654f7fdb681350368ae1547
 --- /dev/null
 +++ b/io/papermc/paper/threadedregions/RegionizedWorldData.java
-@@ -0,0 +1,784 @@
+@@ -0,0 +1,804 @@
 +package io.papermc.paper.threadedregions;
 +
 +import ca.spottedleaf.moonrise.common.list.IteratorSafeOrderedReferenceSet;
@@ -3190,7 +3202,8 @@ index 0000000000000000000000000000000000000000..5db5f9c7305dcab20654f7fdb6813503
 +    private RegionizedServer.WorldLevelData tickData;
 +
 +    // connections
-+    public final List<Connection> connections = new ArrayList<>();
++    private static final Connection[] EMPTY_CONNECTION_ARRAY = new Connection[0];
++    private final ReferenceList<Connection> connections = new ReferenceList<>(EMPTY_CONNECTION_ARRAY);
 +
 +    // misc. fields
 +    private boolean isHandlingTick;
@@ -3369,11 +3382,30 @@ index 0000000000000000000000000000000000000000..5db5f9c7305dcab20654f7fdb6813503
 +            ChunkHolderManager.MAX_TICKET_LEVEL,
 +            player.connection.disconnectTicketId
 +        );
++        player.connection.resumeFlushing();
++    }
++
++    public boolean hasConnection(final Connection conn) {
++        return this.connections.contains(conn);
++    }
++
++    public void removeConnection(final ServerPlayer player) {
++        final ServerGamePacketListenerImpl gamePacketListener = player.connection;
++        gamePacketListener.resumeFlushing();
++
++        this.connections.remove(gamePacketListener.connection);
++    }
++
++    public void addConnection(final ServerPlayer player) {
++        final ServerGamePacketListenerImpl gamePacketListener = player.connection;
++        gamePacketListener.resumeFlushing();
++
++        this.connections.add(gamePacketListener.connection);
 +    }
 +
 +    // connections
 +    public void tickConnections() {
-+        final List<Connection> connections = new ArrayList<>(this.connections);
++        final List<Connection> connections = new ArrayList<>(Arrays.asList(Arrays.copyOf(this.connections.getRawDataUnchecked(), this.connections.size())));
 +        Collections.shuffle(connections);
 +        for (final Connection conn : connections) {
 +            if (!conn.isConnected()) {
@@ -3577,7 +3609,7 @@ index 0000000000000000000000000000000000000000..5db5f9c7305dcab20654f7fdb6813503
 +    }
 +
 +    public void setTickingBlockEntities(final boolean to) {
-+        this.tickingBlockEntities = true;
++        this.tickingBlockEntities = to;
 +    }
 +
 +    public List<TickingBlockEntity> getBlockEntityTickers() {
@@ -7309,6 +7341,69 @@ index 7cbcc8865893ea4f7fae8da13f534c65fcdcd216..fa52d458d402ae9121eaa8b876d8d6b4
          );
      }
  
+@@ -522,4 +522,45 @@ public class CommandSourceStack {
+     }
+ 
++    private boolean scheduleOnOwningThread(final Runnable run) {
++        if (this.entity != null) {
++            if (ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.entity)) {
++                return false;
++            }
++            this.entity.getBukkitEntity().taskScheduler.scheduleOrExecute((final Entity ignored) -> run.run());
++            return true;
++        }
++        if (this.source instanceof net.minecraft.world.level.BaseCommandBlock.CloseableCommandBlockSource) {
++            final net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.containing(this.worldPosition);
++            if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.level, pos)) {
++                io.papermc.paper.threadedregions.RegionizedServer.getInstance().taskQueue.queueOrExecuteTickTask(
++                    this.level, pos.getX() >> 4, pos.getZ() >> 4, run
++                );
++                return true;
++            }
++            return false;
++        }
++        if (!io.papermc.paper.threadedregions.RegionizedServer.isGlobalTickThread()) {
++            io.papermc.paper.threadedregions.RegionizedServer.getInstance().addTask(run);
++            return true;
++        }
++        return false;
++    }
++
++    private boolean isOnOwningThread() {
++        if (this.entity != null) {
++            return ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.entity);
++        }
++        if (this.source instanceof net.minecraft.world.level.BaseCommandBlock.CloseableCommandBlockSource) {
++            final net.minecraft.core.BlockPos pos = net.minecraft.core.BlockPos.containing(this.worldPosition);
++            return ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.level, pos);
++        }
++        return io.papermc.paper.threadedregions.RegionizedServer.isGlobalTickThread();
++    }
++
+     public void sendSuccess(final Supplier<Component> messageSupplier, final boolean broadcast) {
++        if (!this.isOnOwningThread()) {
++            final Component message = messageSupplier.get();
++            this.scheduleOnOwningThread(() -> this.sendSuccess(() -> message, broadcast));
++            return;
++        }
+         boolean shouldSendSystemMessage = this.source.acceptsSuccess() && !this.silent;
+@@ -555,10 +596,16 @@ public class CommandSourceStack {
+     public void sendFailure(final Component message) {
++        if (this.scheduleOnOwningThread(() -> this.sendFailure(message))) {
++            return;
++        }
+         // Paper start - Add UnknownCommandEvent
+         this.sendFailure(message, true);
+     }
+     public void sendFailure(final Component message, final boolean withStyle) {
++        if (this.scheduleOnOwningThread(() -> this.sendFailure(message, withStyle))) {
++            return;
++        }
+         // Paper end - Add UnknownCommandEvent
+         if (this.source.acceptsFailure() && !this.silent) {
+             this.source.sendSystemMessage(withStyle ? Component.empty().append(message).withStyle(ChatFormatting.RED) : message); // Paper - Add UnknownCommandEvent
+         }
+     }
 diff --git a/net/minecraft/commands/Commands.java b/net/minecraft/commands/Commands.java
 index b50e884e874dc65ccd0900cd18e8435f512ba633..b609b9330570450da8d7b9823de4b0715ab6f8eb 100644
 --- a/net/minecraft/commands/Commands.java
@@ -8486,7 +8581,7 @@ index c3bf41af0273e902f881cc070fcef6dd64abb063..b5fdaf806f2672c63e78ad37a0c93834
          int maxPlayers = this.getMaxPlayers();
          if (this.hidesOnlinePlayers()) {
              return new ServerStatus.Players(maxPlayers, players.size(), List.of());
-@@ -1741,29 +1824,32 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -1741,29 +1824,38 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
          return new ServerStatus.Players(maxPlayers, players.size(), sample);
      }
  
@@ -8500,6 +8595,12 @@ index c3bf41af0273e902f881cc070fcef6dd64abb063..b5fdaf806f2672c63e78ad37a0c93834
 -        this.getPlayerList().getPlayers().forEach(playerx -> playerx.connection.suspendFlushing());
 -        this.server.getScheduler().mainThreadHeartbeat(); // CraftBukkit
 +        //this.getPlayerList().getPlayers().forEach(playerx -> playerx.connection.suspendFlushing()); // Folia - region threading
++        // Folia start - region threading - implement flush consolidation
++        final List<ServerPlayer> suspendedFlushes = new java.util.ArrayList<>(regionizedWorldData.getLocalPlayers());
++        for (ServerPlayer player : suspendedFlushes) {
++            player.connection.suspendFlushing();
++        }
++        // Folia end - region threading - implement flush consolidation
 +        //this.server.getScheduler().mainThreadHeartbeat(); // CraftBukkit // Folia - region threading
          // Paper start - optimise Folia entity scheduler
 -        ((io.papermc.paper.threadedregions.scheduler.FoliaGlobalRegionScheduler)org.bukkit.Bukkit.getGlobalRegionScheduler()).tick();
@@ -8597,7 +8698,7 @@ index c3bf41af0273e902f881cc070fcef6dd64abb063..b5fdaf806f2672c63e78ad37a0c93834
          profiler.popPush("debugSubscribers");
          this.debugSubscribers.tick();
          if (this.tickRateManager.runsNormally()) {
-@@ -1828,13 +1914,13 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+@@ -1828,13 +1914,21 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
  
          profiler.popPush("server gui refresh");
  
@@ -8609,6 +8710,14 @@ index c3bf41af0273e902f881cc070fcef6dd64abb063..b5fdaf806f2672c63e78ad37a0c93834
          profiler.popPush("send chunks");
  
 -        for (ServerPlayer player : this.playerList.getPlayers()) {
++        // Folia start - region threading - implement flush consolidation
++        for (ServerPlayer player : suspendedFlushes) {
++            if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(player)) {
++                continue;
++            }
++            player.connection.resumeFlushing();
++        }
++        // Folia end - region threading - implement flush consolidation
 +        if (false) for (ServerPlayer player : this.playerList.getPlayers()) { // Folia - region threading
              player.connection.chunkSender.sendNextChunks(player);
              player.connection.resumeFlushing();
@@ -8797,6 +8906,33 @@ diff --git a/net/minecraft/server/commands/AttributeCommand.java b/net/minecraft
 index c7d9d16ea5625070b99c756f63c05fc5a059cb7a..700d214f0f95479582fe9689dfc7525545e0ee95 100644
 --- a/net/minecraft/server/commands/AttributeCommand.java
 +++ b/net/minecraft/server/commands/AttributeCommand.java
+@@ -171,9 +171,4 @@ public class AttributeCommand {
+-                                                        .suggests(
+-                                                            (c, p) -> SharedSuggestionProvider.suggestResource(
+-                                                                getAttributeModifiers(
+-                                                                    EntityArgument.getEntity(c, "target"), ResourceArgument.getAttribute(c, "attribute")
+-                                                                ),
+-                                                                p
+-                                                            )
+-                                                        )
++                                                        .suggests((c, p) -> suggestAttributeModifiers(
++                                                            c.getSource(), p, EntityArgument.getEntity(c, "target"), ResourceArgument.getAttribute(c, "attribute")
++                                                        ))
+                                                         .executes(
+@@ -195,10 +195,4 @@ public class AttributeCommand {
+-                                                                .suggests(
+-                                                                    (c, p) -> SharedSuggestionProvider.suggestResource(
+-                                                                        getAttributeModifiers(
+-                                                                            EntityArgument.getEntity(c, "target"),
+-                                                                            ResourceArgument.getAttribute(c, "attribute")
+-                                                                        ),
+-                                                                        p
+-                                                                    )
+-                                                                )
++                                                                .suggests((c, p) -> suggestAttributeModifiers(
++                                                                    c.getSource(), p, EntityArgument.getEntity(c, "target"), ResourceArgument.getAttribute(c, "attribute")
++                                                                ))
+                                                                 .executes(
 @@ -258,6 +258,10 @@ public class AttributeCommand {
      }
  
@@ -8832,8 +8968,42 @@ index c7d9d16ea5625070b99c756f63c05fc5a059cb7a..700d214f0f95479582fe9689dfc75255
          LivingEntity livingEntity = getEntityWithAttribute(target, attribute);
          AttributeMap attributes = livingEntity.getAttributes();
          if (!attributes.hasModifier(attribute, id)) {
-@@ -305,6 +319,10 @@ public class AttributeCommand {
+@@ -305,6 +319,44 @@ public class AttributeCommand {
      }
++    private static java.util.concurrent.CompletableFuture<com.mojang.brigadier.suggestion.Suggestions> suggestAttributeModifiers(
++        final CommandSourceStack source,
++        final com.mojang.brigadier.suggestion.SuggestionsBuilder builder,
++        final Entity target,
++        final Holder<Attribute> attribute
++    ) throws CommandSyntaxException {
++        if (ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(target)) {
++            return SharedSuggestionProvider.suggestResource(getAttributeModifiers(target, attribute), builder);
++        }
++        final java.util.concurrent.CompletableFuture<com.mojang.brigadier.suggestion.Suggestions> future =
++            new java.util.concurrent.CompletableFuture<>();
++        final boolean scheduled = target.getBukkitEntity().taskScheduler.schedule(
++            (final Entity owned) -> {
++                try {
++                    SharedSuggestionProvider.suggestResource(getAttributeModifiers(owned, attribute), builder)
++                        .whenComplete((suggestions, throwable) -> {
++                            if (throwable != null) {
++                                future.completeExceptionally(throwable);
++                            } else {
++                                future.complete(suggestions);
++                            }
++                        });
++                } catch (final CommandSyntaxException ex) {
++                    future.completeExceptionally(ex);
++                }
++            },
++            (final Entity retired) -> future.complete(com.mojang.brigadier.suggestion.Suggestions.empty().join()),
++            1L
++        );
++        if (!scheduled) {
++            future.complete(com.mojang.brigadier.suggestion.Suggestions.empty().join());
++        }
++        return future;
++    }
  
      private static int setAttributeBase(final CommandSourceStack source, final Entity target, final Holder<Attribute> attribute, final double value) throws CommandSyntaxException {
 +        return CommandResponseTracker.runOwned(source, target, owned -> setAttributeBaseOwned(source, owned, attribute, value)); // Folia - region threading
@@ -9035,6 +9205,70 @@ index 8f4e8778c44f86bbf4d4809d4d920fc2c0ad0f8c..0afe50004943acdf79b66c4f2363ed21
          this.totalValue += value;
          if (++this.elementCount == 1) {
              this.onlyElement = element;
+@@ -188,19 +291,35 @@ public class CommandResponseTracker<Element> {
+     public <Result> Result dispatch(
+         final CommandResponseTracker.ElementType elementType, final CommandResponseTracker.Dispatch<Result, ? super Element> dispatch
+     ) {
+         Element firstElement = this.firstElement(elementType);
+         return firstElement != null
+             ? dispatch.onSingle().create(firstElement, this.totalValue)
+             : dispatch.onMultiple().create(this.elementCount(elementType), this.totalValue);
+     }
+ 
++    private void sendFeedbackMessage(final CommandSourceStack sourceStack, final boolean broadcast,
++        final CommandResponseTracker.ElementType elementType, final java.util.function.Supplier<Component> messageSupplier) {
++        final Element firstElement = this.firstElement(elementType);
++        if (firstElement instanceof net.minecraft.world.entity.Entity target && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(target)) {
++            target.getBukkitEntity().taskScheduler.schedule(
++                (final net.minecraft.world.entity.Entity ignored) -> {
++                    final Component message = messageSupplier.get();
++                    sourceStack.sendSuccess(() -> message, broadcast);
++                }, null, 1L
++            );
++            return;
++        }
++        final Component message = messageSupplier.get();
++        sourceStack.sendSuccess(() -> message, broadcast);
++    }
++
+     public int sendFeedback(
+         final CommandSourceStack sourceStack,
+         final boolean broadcast,
+         final CommandResponseTracker.ElementType elementType,
+         final CommandResponseTracker.Messages<? super Element> messages
+     ) throws CommandSyntaxException {
+         messages.throwIfZero(this.elementCount(elementType));
+-        sourceStack.sendSuccess(() -> this.dispatch(elementType, messages.onSuccess()), broadcast);
++        this.sendFeedbackMessage(sourceStack, broadcast, elementType, () -> this.dispatch(elementType, messages.onSuccess()));
+         return this.totalValue;
+     }
+@@ -246,11 +365,11 @@ public class CommandResponseTracker<Element> {
+     public <Arg> int sendFeedback(
+         final CommandSourceStack sourceStack,
+         final boolean broadcast,
+         final CommandResponseTracker.ElementType elementType,
+         final CommandResponseTracker.MessagesWithArg<? super Element, Arg> messages,
+         final Arg argument
+     ) throws CommandSyntaxException {
+         messages.throwIfZero(this.elementCount(elementType), argument);
+-        sourceStack.sendSuccess(() -> this.dispatch(elementType, messages.onSuccess(), argument), broadcast);
++        this.sendFeedbackMessage(sourceStack, broadcast, elementType, () -> this.dispatch(elementType, messages.onSuccess(), argument));
+         return this.totalValue;
+     }
+@@ -304,12 +423,12 @@ public class CommandResponseTracker<Element> {
+     public <Arg0, Arg1> int sendFeedback(
+         final CommandSourceStack sourceStack,
+         final boolean broadcast,
+         final CommandResponseTracker.ElementType elementType,
+         final CommandResponseTracker.MessagesWithArgs<? super Element, Arg0, Arg1> messages,
+         final Arg0 argument0,
+         final Arg1 argument1
+     ) throws CommandSyntaxException {
+         messages.throwIfZero(this.elementCount(elementType), argument0, argument1);
+-        sourceStack.sendSuccess(() -> this.dispatch(elementType, messages.onSuccess(), argument0, argument1), broadcast);
++        this.sendFeedbackMessage(sourceStack, broadcast, elementType, () -> this.dispatch(elementType, messages.onSuccess(), argument0, argument1));
+         return this.totalValue;
+     }
 diff --git a/net/minecraft/server/commands/DamageCommand.java b/net/minecraft/server/commands/DamageCommand.java
 index bec064ee3fa076961e8266e4c879da1c24f857a5..6f837759d77f2461898be62974b72dd5bb4c79d9 100644
 --- a/net/minecraft/server/commands/DamageCommand.java
@@ -11827,9 +12061,10 @@ index 8389d812b2d80a122fd1945b3182c08cdeda7d1c..44b457603f4641a37ff4f3808090064d
              }
          }
          } // Paper - option to disable pathfinding updates
-@@ -1903,37 +1997,37 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
+@@ -1903,37 +1997,42 @@ public class ServerLevel extends Level implements WorldGenLevel, ServerEntityGet
      @Override
      public void updateNeighborsAt(final BlockPos pos, final Block sourceBlock) {
++        if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this, pos)) return; // Folia - region threading - suppress cross-region block updates
          // CraftBukkit start
 -        if (this.populating) {
 +        if (this.getCurrentWorldData().populating) { // Folia - region threading
@@ -11843,6 +12078,7 @@ index 8389d812b2d80a122fd1945b3182c08cdeda7d1c..44b457603f4641a37ff4f3808090064d
  
      @Override
      public void updateNeighborsAt(final BlockPos pos, final Block sourceBlock, final @Nullable Orientation orientation) {
++        if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this, pos)) return; // Folia - region threading - suppress cross-region block updates
 -        if (captureBlockStates) { return; } // Paper - Cancel all physics during placement
 -        this.neighborUpdater.updateNeighborsAtExceptFromFacing(pos, sourceBlock, null, orientation);
 +        if (this.getCurrentWorldData().captureBlockStates) { return; } // Paper - Cancel all physics during placement // Folia - region threading
@@ -11853,12 +12089,14 @@ index 8389d812b2d80a122fd1945b3182c08cdeda7d1c..44b457603f4641a37ff4f3808090064d
      public void updateNeighborsAtExceptFromFacing(
          final BlockPos pos, final Block blockObject, final Direction skipDirection, final @Nullable Orientation orientation
      ) {
++        if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this, pos)) return; // Folia - region threading - suppress cross-region block updates
 -        this.neighborUpdater.updateNeighborsAtExceptFromFacing(pos, blockObject, skipDirection, orientation);
 +        this.getCurrentWorldData().neighborUpdater.updateNeighborsAtExceptFromFacing(pos, blockObject, skipDirection, orientation); // Folia - region threading
      }
  
      @Override
      public void neighborChanged(final BlockPos pos, final Block changedBlock, final @Nullable Orientation orientation) {
++        if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this, pos)) return; // Folia - region threading - suppress cross-region block updates
 -        this.neighborUpdater.neighborChanged(pos, changedBlock, orientation);
 +        this.getCurrentWorldData().neighborUpdater.neighborChanged(pos, changedBlock, orientation); // Folia - region threading
      }
@@ -11867,6 +12105,7 @@ index 8389d812b2d80a122fd1945b3182c08cdeda7d1c..44b457603f4641a37ff4f3808090064d
      public void neighborChanged(
          final BlockState state, final BlockPos pos, final Block changedBlock, final @Nullable Orientation orientation, final boolean movedByPiston
      ) {
++        if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this, pos)) return; // Folia - region threading - suppress cross-region block updates
 -        this.neighborUpdater.neighborChanged(state, pos, changedBlock, orientation, movedByPiston);
 +        this.getCurrentWorldData().neighborUpdater.neighborChanged(state, pos, changedBlock, orientation, movedByPiston); // Folia - region threading
      }
@@ -12523,7 +12762,7 @@ index 56ee7ed4bdedbc5f7d12b9ccd547ff3984158b1d..9bf5359b37787152727508b28b171ba3
 +            ServerPlayer.this.reset();
 +        }
 +        // must be manually removed from connections, delay until after reset() so that we do not trip any thread checks
-+        this.level().getCurrentWorldData().connections.remove(this.connection.connection);
++        this.level().getCurrentWorldData().removeConnection(this);
 +
 +        ca.spottedleaf.concurrentutil.completable.CallbackCompletable<org.bukkit.Location> spawnPosComplete =
 +            new ca.spottedleaf.concurrentutil.completable.CallbackCompletable<>();
@@ -12635,7 +12874,7 @@ index 56ee7ed4bdedbc5f7d12b9ccd547ff3984158b1d..9bf5359b37787152727508b28b171ba3
 +    @Override
 +    protected ServerPlayer transformForAsyncTeleport(ServerLevel destination, Vec3 pos, Float yaw, Float pitch, Vec3 velocity) {
 +        // must be manually removed from connections
-+        this.level().getCurrentWorldData().connections.remove(this.connection.connection);
++        this.level().getCurrentWorldData().removeConnection(this);
 +        this.level().removePlayerImmediately(this, Entity.RemovalReason.CHANGED_DIMENSION);
 +
 +        this.setServerLevel(destination);
@@ -12657,7 +12896,7 @@ index 56ee7ed4bdedbc5f7d12b9ccd547ff3984158b1d..9bf5359b37787152727508b28b171ba3
 +            destination.addDuringTeleport(this);
 +
 +            // must be manually added to connections
-+            this.level().getCurrentWorldData().connections.add(this.connection.connection);
++            this.level().getCurrentWorldData().addConnection(this);
 +
 +            // required to set up the pending teleport stuff to the client, and to actually update
 +            // the player's position clientside
@@ -12710,7 +12949,7 @@ index 56ee7ed4bdedbc5f7d12b9ccd547ff3984158b1d..9bf5359b37787152727508b28b171ba3
 +            destination.addDuringTeleport(this);
 +
 +            // must be manually added to connections
-+            this.level().getCurrentWorldData().connections.add(this.connection.connection);
++            this.level().getCurrentWorldData().addConnection(this);
 +
 +            // required to set up the pending teleport stuff to the client, and to actually update
 +            // the player's position clientside
@@ -13407,7 +13646,7 @@ index ee455011ff5d35466c1ee2f720c03ecef8d5237a..1fb3b1aeb1be7da63880b7397a000090
          this.removePlayerFromWorld();
 +        } finally { // Folia start - rewrite login process - move connection ownership to global region
 +            io.papermc.paper.threadedregions.RegionizedWorldData worldData = this.player.level().getCurrentWorldData();
-+            worldData.connections.remove(this.connection);
++            worldData.removeConnection(this.player);
 +            // once waitingForSwitchToConfig is set, the global tick thread will own the connection
 +        } // Folia end - rewrite login process - move connection ownership to global region
 +        this.waitingForSwitchToConfig = true; // Folia - rewrite login process - fix bad ordering of this field write - moved down
@@ -13831,7 +14070,7 @@ index a7f589970a04e520eb5cbe6dfeb333bc9cd479a8..593e3fecd6ea878bda2199abf60d29ab
          ServerGamePacketListenerImpl playerConnection = new ServerGamePacketListenerImpl(this.server, connection, player, cookie);
 +        // Folia start - rewrite login process
 +        // only after setting the connection listener to game type, add the connection to this regions list
-+        level.getCurrentWorldData().connections.add(connection);
++        level.getCurrentWorldData().addConnection(player);
 +        // Folia end - rewrite login process
          connection.setupInboundProtocol(
              GameProtocols.SERVERBOUND_TEMPLATE.bind(RegistryFriendlyByteBuf.decorator(this.server.registryAccess()), playerConnection), playerConnection
@@ -17618,10 +17857,11 @@ index 21878bd770f6c0bc10dd0a67be5bd94d7e16f741..a596cbc1109d72cc10247fb5f42b8c2d
                      org.bukkit.event.block.BlockPhysicsEvent event = new org.bukkit.event.block.BlockPhysicsEvent(org.bukkit.craftbukkit.block.CraftBlock.at(this, pos), blockState.asBlockData());
                      cancelledUpdates = !event.callEvent(); // Paper - Fix block place logic
                  }
-@@ -1272,7 +1290,7 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
+@@ -1272,7 +1290,8 @@ public abstract class Level implements LevelAccessor, AutoCloseable, ca.spottedl
          final @Block.UpdateFlags int updateFlags,
          final int updateLimit
      ) {
++        if (this instanceof net.minecraft.server.level.ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos)) return; // Folia - region threading - suppress cross-region shape updates
 -        this.neighborUpdater.shapeUpdate(direction, neighborState, pos, neighborPos, updateFlags, updateLimit);
 +        this.getCurrentWorldData().neighborUpdater.shapeUpdate(direction, neighborState, pos, neighborPos, updateFlags, updateLimit); // Folia - region threading
      }
@@ -18268,8 +18508,9 @@ diff --git a/net/minecraft/world/level/block/RedstoneTorchBlock.java b/net/minec
 index e6680b9bfa001e6c00598256f13d4e74b64dc32c..51c652b14148ae77957a479e563d8f4f67cddbf3 100644
 --- a/net/minecraft/world/level/block/RedstoneTorchBlock.java
 +++ b/net/minecraft/world/level/block/RedstoneTorchBlock.java
-@@ -62,10 +62,10 @@ public class RedstoneTorchBlock extends BaseTorchBlock {
+@@ -62,10 +62,11 @@ public class RedstoneTorchBlock extends BaseTorchBlock {
      protected void tick(final BlockState state, final ServerLevel level, final BlockPos pos, final RandomSource random) {
++        if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(level, pos, 1)) return; // Folia - region threading - torch neighbor reads
          boolean neighborSignal = this.hasNeighborSignal(level, pos, state);
          // Paper start - Faster redstone torch rapid clock removal
 -        java.util.ArrayDeque<RedstoneTorchBlock.Toggle> toggles = level.redstoneUpdateInfos;
@@ -18281,6 +18522,16 @@ index e6680b9bfa001e6c00598256f13d4e74b64dc32c..51c652b14148ae77957a479e563d8f4f
                  toggles.poll();
              }
          }
+@@ -96,8 +96,9 @@ public class RedstoneTorchBlock extends BaseTorchBlock {
+     protected void neighborChanged(
+         final BlockState state, final Level level, final BlockPos pos, final Block block, final @Nullable Orientation orientation, final boolean movedByPiston
+     ) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 1)) return; // Folia - region threading - torch neighbor reads
+         if (state.getValue(LIT) == this.hasNeighborSignal(level, pos, state) && !level.getBlockTicks().willTickThisTick(pos, this)) {
+             level.scheduleTick(pos, this, 2);
+         }
+     }
+ 
 @@ -140,13 +140,13 @@ public class RedstoneTorchBlock extends BaseTorchBlock {
  
      private static boolean isToggledTooFrequently(final Level level, final BlockPos pos, final boolean add) {
@@ -19109,6 +19360,14 @@ index 92afbd653c6aaff973110d24357f68140e75d418..a71916d41a6e02106fd73725dfb18017
                  event = 2;
              }
  
+@@ -94,2 +94,3 @@ public class PistonBaseBlock extends DirectionalBlock {
+     private void checkIfExtend(final Level level, final BlockPos pos, final BlockState state) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 24)) return; // Folia - region threading - piston structure and neighbor reads span multiple chunks
+         Direction direction = state.getValue(FACING);
+@@ -140,2 +140,3 @@ public class PistonBaseBlock extends DirectionalBlock {
+     protected boolean triggerEvent(final BlockState state, final Level level, final BlockPos pos, final int b0, final int b1) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 24)) return false; // Folia - region threading - piston structure and neighbor reads span multiple chunks
+         Direction direction = state.getValue(FACING);
 diff --git a/net/minecraft/world/level/block/piston/PistonMovingBlockEntity.java b/net/minecraft/world/level/block/piston/PistonMovingBlockEntity.java
 index 2126385a1fb5c89e01920f3a8cc77eb4ac78c87e..df068a03663411e723a83a5c998e7a3f17b7e628 100644
 --- a/net/minecraft/world/level/block/piston/PistonMovingBlockEntity.java
@@ -20170,3 +20429,74 @@ index 9fdc1fc6945621b0c938d9ada8a25eb57f034af5..d9a3d2b46339cdbfe826b60d9e0fd711
      @Override
      public Value applyTimeBased(final Value baseValue, final int cacheTickId) {
          if (this.cachedArgument == null || cacheTickId != this.cachedTickId) {
+diff --git a/net/minecraft/world/level/block/DiodeBlock.java b/net/minecraft/world/level/block/DiodeBlock.java
+--- a/net/minecraft/world/level/block/DiodeBlock.java
++++ b/net/minecraft/world/level/block/DiodeBlock.java
+@@ -51,2 +51,3 @@ public abstract class DiodeBlock extends HorizontalDirectionalBlock {
+     protected void tick(final BlockState state, final ServerLevel level, final BlockPos pos, final RandomSource random) {
++        if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(level, pos, 1)) return; // Folia - region threading - diode input reads
+         if (!this.isLocked(level, pos, state)) {
+@@ -77,4 +78,5 @@ public abstract class DiodeBlock extends HorizontalDirectionalBlock {
+     protected void neighborChanged(
+         final BlockState state, final Level level, final BlockPos pos, final Block block, final @Nullable Orientation orientation, final boolean movedByPiston
+     ) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 1)) return; // Folia - region threading - diode input reads
+         if (level.getBlockState(pos).is(this)) {
+@@ -95,2 +96,3 @@ public abstract class DiodeBlock extends HorizontalDirectionalBlock {
+     protected void checkTickOnNeighbor(final Level level, final BlockPos pos, final BlockState state) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 1)) return; // Folia - region threading - diode input reads
+         if (!this.isLocked(level, pos, state)) {
+@@ -120,2 +122,3 @@ public abstract class DiodeBlock extends HorizontalDirectionalBlock {
+     protected int getInputSignal(final Level level, final BlockPos pos, final BlockState state) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 1)) return Redstone.SIGNAL_MIN; // Folia - region threading - diode input reads
+         Direction direction = state.getValue(FACING);
+@@ -132,2 +135,3 @@ public abstract class DiodeBlock extends HorizontalDirectionalBlock {
+     protected int getAlternateSignal(final SignalGetter level, final BlockPos pos, final BlockState state) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 1)) return Redstone.SIGNAL_MIN; // Folia - region threading - diode side-input reads
+         Direction direction = state.getValue(FACING);
+@@ -169,2 +173,3 @@ public abstract class DiodeBlock extends HorizontalDirectionalBlock {
+     public void setPlacedBy(final Level level, final BlockPos pos, final BlockState state, final @Nullable LivingEntity by, final ItemStack itemStack) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 1)) return; // Folia - region threading - diode input reads
+         if (this.shouldTurnOn(level, pos, state)) {
+@@ -207,2 +212,3 @@ public abstract class DiodeBlock extends HorizontalDirectionalBlock {
+     public boolean shouldPrioritize(final BlockGetter level, final BlockPos pos, final BlockState state) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 1)) return false; // Folia - region threading - diode neighbor reads
+         Direction direction = state.getValue(FACING).getOpposite();
+diff --git a/net/minecraft/world/level/block/ComparatorBlock.java b/net/minecraft/world/level/block/ComparatorBlock.java
+--- a/net/minecraft/world/level/block/ComparatorBlock.java
++++ b/net/minecraft/world/level/block/ComparatorBlock.java
+@@ -61,2 +61,3 @@ public class ComparatorBlock extends DiodeBlock implements EntityBlock {
+     protected int getOutputSignal(final BlockGetter level, final BlockPos pos, final BlockState state) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 1)) return Redstone.SIGNAL_MIN; // Folia - region threading - comparator block entity read
+         return level.getBlockEntity(pos) instanceof ComparatorBlockEntity comparatorBlockEntity ? comparatorBlockEntity.getOutputSignal() : Redstone.SIGNAL_MIN;
+@@ -91,2 +92,3 @@ public class ComparatorBlock extends DiodeBlock implements EntityBlock {
+     protected int getInputSignal(final Level level, final BlockPos pos, final BlockState state) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 2)) return Redstone.SIGNAL_MIN; // Folia - region threading - comparator reads two blocks and item frames
+         int resultSignal = super.getInputSignal(level, pos, state);
+@@ -141,2 +143,3 @@ public class ComparatorBlock extends DiodeBlock implements EntityBlock {
+     protected void checkTickOnNeighbor(final Level level, final BlockPos pos, final BlockState state) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 2)) return; // Folia - region threading - comparator reads two blocks
+         if (!level.getBlockTicks().willTickThisTick(pos, this)) {
+@@ -154,2 +157,3 @@ public class ComparatorBlock extends DiodeBlock implements EntityBlock {
+     private void refreshOutputState(final Level level, final BlockPos pos, final BlockState state) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 2)) return; // Folia - region threading - comparator reads two blocks
+         int outputValue = this.calculateOutputSignal(level, pos, state);
+@@ -192,2 +196,3 @@ public class ComparatorBlock extends DiodeBlock implements EntityBlock {
+     protected boolean triggerEvent(final BlockState state, final Level level, final BlockPos pos, final int b0, final int b1) {
++        if (level instanceof ServerLevel serverLevel && !ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(serverLevel, pos, 1)) return false; // Folia - region threading - comparator block entity read
+         super.triggerEvent(state, level, pos, b0, b1);
+diff --git a/net/minecraft/world/level/gameevent/GameEventDispatcher.java b/net/minecraft/world/level/gameevent/GameEventDispatcher.java
+--- a/net/minecraft/world/level/gameevent/GameEventDispatcher.java
++++ b/net/minecraft/world/level/gameevent/GameEventDispatcher.java
+@@ -49,6 +49,11 @@ public class GameEventDispatcher {
+ 
+         for (int chunkX = sectionMinX; chunkX <= sectionMaxX; chunkX++) {
+             for (int chunkZ = sectionMinZ; chunkZ <= sectionMaxZ; chunkZ++) {
++                // Folia start - thread check game events
++                if (!ca.spottedleaf.moonrise.common.util.TickThread.isTickThreadFor(this.level, chunkX, chunkZ, 1)) {
++                    continue;
++                }
++                // Folia end - thread check game events
+                 ChunkAccess chunk = this.level.getChunkIfLoadedImmediately(chunkX, chunkZ); // Paper - Use getChunkIfLoadedImmediately
+                 if (chunk != null) {
+                     for (int section = sectionMinY; section <= sectionMaxY; section++) {
